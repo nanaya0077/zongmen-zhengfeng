@@ -1,4 +1,4 @@
-/* AI 与寻路：招募、派遣、进攻 */
+/* AI 与寻路：招募、回防、分队评估与扩张 */
 (function (global) {
   'use strict';
   var D = global.SLGData;
@@ -66,7 +66,7 @@
   }
 
   function orderMove(world, cult, cell) {
-    if (!cult || !cult.alive) return false;
+    if (!cult || !cult.alive || !cult.pos) return false;
     var r = dijkstra(world, cult.pos);
     var idx = cell.y * W + cell.x;
     if (!isFinite(r.dist[idx])) return false;
@@ -77,33 +77,42 @@
     return true;
   }
 
-  /* ---------- 招募 ---------- */
+  /* ---------- 招募（境界受宗门等级限制） ---------- */
   function genCandidates(world, sect) {
     var n = 2 + sect.level, out = [];
-    for (var i = 0; i < n; i++) out.push(Wd.makeCultivator(world.rnd, sect.id, 'y' + world.year + '_' + i));
+    var maxR = Wd.levelMaxRealm(sect.level);
+    for (var i = 0; i < n; i++) {
+      out.push(Wd.makeCultivator(world.rnd, sect.id, 'y' + world.year + '_' + i, maxR));
+    }
     return out;
   }
 
   function scoreCandidate(c) {
-    return c.lg.rate * 10 + Math.sqrt(D.REALM_MUL[c.realm]) * 6;
+    return c.lg.rate * 10 + Math.sqrt(D.REALM_MUL[c.realm]) * 6 + c.power * 2;
   }
 
   function aiRecruit(world, sect) {
+    if (sect.dead || !sect.home) return [];
     var free = sect.housing - sect.cultivators.length;
     if (free <= 0) return [];
     var cands = genCandidates(world, sect).sort(function (a, b) { return scoreCandidate(b) - scoreCandidate(a); });
     var take = cands.slice(0, Math.min(free, cands.length));
-    take.forEach(function (c) { c.pos = { x: sect.home.x, y: sect.home.y }; sect.cultivators.push(c); });
+    take.forEach(function (c) {
+      c.pos = { x: sect.home.x, y: sect.home.y };
+      c.prevPos = { x: sect.home.x, y: sect.home.y };
+      sect.cultivators.push(c);
+    });
     return take;
   }
 
-  /* ---------- 派遣与进攻 ---------- */
-  var TV = { M: 3.0, P: 2.0, R: 2.2, H: 1.5, F: 1.2, C: 1.0, L: 0.6 };
-  function cellValue(c) { return TV[c.t] + (c.village ? 2.0 : 0); }
+  /* ---------- 派遣、回防与进攻 ---------- */
+  var TV = { M: 3.0, P: 2.0, R: 2.2, H: 1.5, F: 1.4, C: 1.0, L: 0.6 };
+  function cellValue(c) { return TV[c.t] + (c.village ? 2.0 : 0) + (c.city ? 4.0 : 0); }
 
   function occupants(world) {
     var m = new Map();
     Object.keys(world.sects).forEach(function (id) {
+      if (world.sects[id].dead) return;
       world.sects[id].cultivators.forEach(function (c) {
         if (!c.alive || !c.pos) return;
         var k = c.pos.y * W + c.pos.x;
@@ -123,62 +132,184 @@
       if (c.owner !== sect.id || c.city) continue;
       if (c.t !== 'P' && c.t !== 'R') continue;
       if (c.x === sect.home.x && c.y === sect.home.y) continue;
-      // 优先建在离山门最远的地盘上，把势力范围往外推
       var d = Math.abs(c.x - sect.home.x) + Math.abs(c.y - sect.home.y);
       if (d > bestD) { bestD = d; best = c; }
     }
     if (best) Wd.buildCity(world, sect, best);
   }
 
+  function aiDevelopResources(world, sect) {
+    var nextReq = D.LEVEL_REQ[sect.level + 1];
+    var reserveStones = nextReq && sect.pop >= nextReq.pop * 0.7 && sect.rep >= nextReq.rep * 0.6 ? nextReq.stones : 0;
+    var spareStones = sect.stones - reserveStones;
+    // 灵石消耗：预留升级灵石后，培养高资质弟子或炼制护身符
+    if (spareStones >= 360 && sect.cultivators.length) {
+      var bestCult = null, bestScore = -1;
+      for (var i = 0; i < sect.cultivators.length; i++) {
+        var c = sect.cultivators[i];
+        if (!c.alive || c.realm >= 6) continue;
+        var sc = c.lg.rate + c.power;
+        if (sc > bestScore) { bestScore = sc; bestCult = c; }
+      }
+      if (bestCult) Wd.boostCultivator(world, sect, bestCult);
+    }
+    if (sect.stones - reserveStones >= 450 && sect.ore >= 160 && sect.cultivators.length) {
+      var ace = null, maxP = -1;
+      for (var j = 0; j < sect.cultivators.length; j++) {
+        var c2 = sect.cultivators[j];
+        if (!c2.alive || c2.talisman > 0) continue;
+        if (c2.power > maxP) { maxP = c2.power; ace = c2; }
+      }
+      if (ace) Wd.craftTalisman(world, sect, ace);
+    }
+    // 铜钱消耗：补缺木材/矿石或招流民
+    if (sect.copper >= 450) {
+      if (sect.wood < 250) Wd.spendCopper(world, sect, 'wood');
+      else if (sect.ore < 200) Wd.spendCopper(world, sect, 'ore');
+      else Wd.spendCopper(world, sect, 'pop');
+    }
+  }
+
+  function enemyPowerAt(occ, idx, myId) {
+    var list = occ.get(idx);
+    if (!list) return 0;
+    var p = 0;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].alive && list[i].sect !== myId) p += list[i].power;
+    }
+    return p;
+  }
+
+  function findThreatenedHub(world, sect, occ) {
+    var hubs = [sect.home].concat(sect.cities || []);
+    for (var h = 0; h < hubs.length; h++) {
+      var hb = hubs[h];
+      if (!hb) continue;
+      for (var dy = -1; dy <= 1; dy++) for (var dx = -1; dx <= 1; dx++) {
+        if (Math.abs(dx) + Math.abs(dy) > 1) continue;
+        var nx = hb.x + dx, ny = hb.y + dy;
+        if (!inMap(nx, ny)) continue;
+        var ePow = enemyPowerAt(occ, ny * W + nx, sect.id);
+        if (ePow > 0) {
+          var hIdx = hb.y * W + hb.x;
+          var list = occ.get(hIdx) || [];
+          var defPow = 0;
+          for (var i = 0; i < list.length; i++) {
+            if (list[i].alive && list[i].sect === sect.id) defPow += list[i].power;
+          }
+          if (defPow < ePow * 1.1) return world.at(hb.x, hb.y);
+        }
+      }
+    }
+    return null;
+  }
+
   function aiThink(world, sect, dt) {
+    if (sect.dead || !sect.home) return;
     sect.aiTimer = (sect.aiTimer || 0) + dt;
     if (sect.aiTimer < 6) return;
     sect.aiTimer = 0;
 
     aiBuildCity(world, sect);
+    aiDevelopResources(world, sect);
 
     var occ = world._occ || new Map();
 
-    // 驻守点丢了就重新找
+    // 驻守点丢了或正在战斗完成后重置无效驻守
     sect.cultivators.forEach(function (c) {
       if (!c.post) return;
       var cell = world.cells[c.post.y * W + c.post.x];
       if (cell.owner !== null && cell.owner !== sect.id) c.post = null;
     });
 
+    // 1) 山门/城池遇袭回防
+    var threatened = findThreatenedHub(world, sect, occ);
+    if (threatened) {
+      var defenders = sect.cultivators.filter(function (c) {
+        return c.alive && c.pos && c.state !== 'fighting' &&
+          (c.pos.x !== threatened.x || c.pos.y !== threatened.y);
+      });
+      defenders.sort(function (a, b) {
+        var da = Math.abs(a.pos.x - threatened.x) + Math.abs(a.pos.y - threatened.y);
+        var db = Math.abs(b.pos.x - threatened.x) + Math.abs(b.pos.y - threatened.y);
+        return da - db;
+      });
+      var sent = 0;
+      for (var dIdx = 0; dIdx < defenders.length && sent < 3; dIdx++) {
+        defenders[dIdx].post = { x: threatened.x, y: threatened.y };
+        if (orderMove(world, defenders[dIdx], threatened)) sent++;
+      }
+      if (sent > 0) return;
+    }
+
+    // 2) 收集已被本宗锁定的目标格，避免扎堆选中同一格
+    var claimed = new Set();
+    sect.cultivators.forEach(function (c) {
+      if (!c.alive) return;
+      if (c.post) claimed.add(c.post.y * W + c.post.x);
+      if (c.path && c.path.length && c.target) claimed.add(c.target.y * W + c.target.x);
+    });
+
+    // 3) 筛选闲置修士并按所在格编组（以真实小队战力评估敌方目标）
     var free = sect.cultivators.filter(function (c) {
-      return c.alive && c.pos && !c.post && (!c.path || !c.path.length);
+      return c.alive && c.pos && c.state !== 'fighting' && !c.post && (!c.path || !c.path.length);
     });
     if (!free.length) return;
 
-    var maxPower = 0;
-    sect.cultivators.forEach(function (c) { if (c.alive && c.power > maxPower) maxPower = c.power; });
+    var groups = new Map();
+    for (var fi = 0; fi < free.length; fi++) {
+      var fc = free[fi];
+      var fk = fc.pos.y * W + fc.pos.x;
+      if (!groups.has(fk)) groups.set(fk, []);
+      groups.get(fk).push(fc);
+    }
 
-    var batch = free.slice(0, 2);
-    batch.forEach(function (cult) {
-      var r = dijkstra(world, cult.pos);
-      var best = null, bestScore = -1;
+    var ordersLeft = 2;
+    groups.forEach(function (squad) {
+      if (ordersLeft <= 0 || !squad.length) return;
+      var anchor = squad[0];
+      var r = dijkstra(world, anchor.pos);
+      var squadPower = 0;
+      for (var si = 0; si < squad.length; si++) squadPower += squad[si].power;
+
+      // 从小队里派单兵扩荒或整队出击
+      var bestExpand = null, bestExpandScore = -1;
+      var bestAttack = null, bestAttackScore = -1;
 
       for (var idx = 0; idx < world.cells.length; idx++) {
         var c = world.cells[idx];
-        if (c.owner === sect.id) continue;
+        if (c.owner === sect.id || claimed.has(idx)) continue;
         var d = r.dist[idx];
         if (!isFinite(d) || d > 25) continue;
 
-        var score = 0;
         if (c.owner === null) {
-          score = cellValue(c) / (d + 1);
-        } else if (world.year >= 8) {          // 前八年休战，只占地不打人
-          var def = 0;
-          var list = occ.get(idx);
-          if (list) for (var i = 0; i < list.length; i++) def += list[i].power;
-          if (maxPower > def * 1.4) score = (cellValue(c) + 3) / (d + 1);
+          var es = cellValue(c) / (d + 1);
+          if (es > bestExpandScore) { bestExpandScore = es; bestExpand = c; }
+        } else if (world.year >= 8) {
+          var def = enemyPowerAt(occ, idx, sect.id);
+          if (squadPower > def * 1.25) {
+            var isTargetHub = (world.sects[c.owner] && world.sects[c.owner].home &&
+              world.sects[c.owner].home.x === c.x && world.sects[c.owner].home.y === c.y) || c.city > 0;
+            var as = (cellValue(c) + (isTargetHub ? 6 : 3)) / (d + 1);
+            if (as > bestAttackScore) { bestAttackScore = as; bestAttack = c; }
+          }
         }
-        if (score > bestScore) { bestScore = score; best = c; }
       }
-      if (best) {
-        cult.post = { x: best.x, y: best.y };
-        orderMove(world, cult, best);
+
+      if (bestAttack && (!bestExpand || bestAttackScore >= bestExpandScore * 1.15)) {
+        var attIdx = bestAttack.y * W + bestAttack.x;
+        claimed.add(attIdx);
+        squad.forEach(function (cu) {
+          cu.post = { x: bestAttack.x, y: bestAttack.y };
+          orderMove(world, cu, bestAttack);
+        });
+        ordersLeft--;
+      } else if (bestExpand) {
+        var expIdx = bestExpand.y * W + bestExpand.x;
+        claimed.add(expIdx);
+        anchor.post = { x: bestExpand.x, y: bestExpand.y };
+        orderMove(world, anchor, bestExpand);
+        ordersLeft--;
       }
     });
   }
